@@ -97,7 +97,6 @@ extensions = [
     CrossStitchHelper,
     CutSatin,
     CutworkSegmentation,
-    DaemonLettering,
     DensityMap,
     DisplayStackingOrder,
     DuplicateParams,
