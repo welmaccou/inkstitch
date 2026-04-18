@@ -25,7 +25,7 @@ from ..extensions.lettering_along_path import TextAlongPath
 from ..lettering import get_font_by_name
 from ..output import write_embroidery_file
 from ..stitch_plan import stitch_groups_to_stitch_plan
-from ..svg import get_correction_transform
+from ..svg import PIXELS_PER_MM, get_correction_transform
 from ..threads import ThreadCatalog
 from ..utils import DotDict
 from .base import InkstitchExtension
@@ -110,7 +110,8 @@ class DaemonLettering(InkstitchExtension):
         self._emit_json(payload)
 
     def _should_skip_stitch_plan_computation(self, file_formats):
-        return self.draft_mode and len(file_formats) == 1 and file_formats[0] == 'svg'
+        include_preview = getattr(self, "include_preview", False)
+        return self.draft_mode and (not include_preview) and len(file_formats) == 1 and file_formats[0] == 'svg'
 
     def _render_text_svg_only(self, text, text_positioning_path):
         self.settings = DotDict({
@@ -189,6 +190,7 @@ class DaemonLettering(InkstitchExtension):
                 "line_height": float(payload.get("line_height", 0.0)),
                 "text_position": payload.get("text_position", "left"),
                 "draft_mode": bool(payload.get("draft_mode", False)),
+                "include_preview": bool(payload.get("include_preview", False)),
                 "formats": list(file_formats),
             },
             sort_keys=True,
@@ -204,12 +206,70 @@ class DaemonLettering(InkstitchExtension):
         self._response_cache.move_to_end(cache_key)
         return cached
 
-    def _set_cached_response(self, cache_key, zip_b64):
-        self._response_cache[cache_key] = zip_b64
+    def _set_cached_response(self, cache_key, response_payload):
+        self._response_cache[cache_key] = response_payload
         self._response_cache.move_to_end(cache_key)
 
         while len(self._response_cache) > self.MAX_RESPONSE_CACHE_ITEMS:
             self._response_cache.popitem(last=False)
+
+    @staticmethod
+    def _preview_command_for_stitch(stitch):
+        if stitch.color_change or stitch.stop:
+            return 2
+        if stitch.trim:
+            return 3
+        if stitch.jump:
+            return 1
+        return 0
+
+    @staticmethod
+    def _preview_coord(value):
+        return round((float(value) / PIXELS_PER_MM) * 10.0, 3)
+
+    def _serialize_preview_payload(self, stitch_plan):
+        bounds = stitch_plan.bounding_box
+        colors = []
+        blocks = []
+
+        for block_index, color_block in enumerate(stitch_plan):
+            thread_color = color_block.color.visible_on_white if color_block.color else None
+            colors.append(
+                {
+                    "hex": thread_color.to_hex_str() if thread_color else "#000000",
+                    "name": getattr(thread_color, "description", "") or getattr(thread_color, "name", "") or "",
+                }
+            )
+
+            block_stitches = []
+            stitch_count = 0
+            for stitch in color_block:
+                cmd = self._preview_command_for_stitch(stitch)
+                block_stitches.append([
+                    self._preview_coord(stitch.x),
+                    self._preview_coord(stitch.y),
+                    cmd,
+                ])
+                if cmd == 0:
+                    stitch_count += 1
+
+            if stitch_count == 0:
+                continue
+
+            blocks.append({
+                "color_index": block_index,
+                "stitches": block_stitches,
+            })
+
+        return {
+            "bounds": [self._preview_coord(value) for value in bounds],
+            "colors": colors,
+            "blocks": blocks,
+            "stitches": stitch_plan.num_stitches,
+            "validation_error": False,
+            "validation_reason": "",
+            "source_format": "daemon_preview",
+        }
 
     def handle_generate(self, payload):
         started_at = time.perf_counter()
@@ -241,15 +301,13 @@ class DaemonLettering(InkstitchExtension):
             return
 
         cache_key = self._build_cache_key(payload, file_formats)
-        cached_zip_b64 = self._get_cached_response(cache_key)
-        if cached_zip_b64 is not None:
+        cached_response = self._get_cached_response(cache_key)
+        if cached_response is not None:
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-            response_payload = {
-                "status": "success",
-                "zip_base64": cached_zip_b64,
-                "cache_hit": True,
-                "elapsed_ms": elapsed_ms,
-            }
+            response_payload = deepcopy(cached_response)
+            response_payload["status"] = "success"
+            response_payload["cache_hit"] = True
+            response_payload["elapsed_ms"] = elapsed_ms
             if request_id:
                 response_payload["request_id"] = request_id
             self._emit_json(response_payload)
@@ -265,6 +323,8 @@ class DaemonLettering(InkstitchExtension):
         self.options.line_height = float(payload.get("line_height", 0))
         self.options.text_position = payload.get("text_position", "left")
         self.draft_mode = bool(payload.get("draft_mode", False))
+        include_preview = bool(payload.get("include_preview", False))
+        self.include_preview = include_preview
         
         separator = payload.get("separator", "\n")
         texts = text_input.replace('\\n', '\n').split(separator)
@@ -287,10 +347,13 @@ class DaemonLettering(InkstitchExtension):
 
         try:
             self._emit_progress(request_id, "Gerando pontos no Ink/Stitch...", progress_pct=1)
-            zip_buffer = io.BytesIO()
-            zip_file = ZipFile(zip_buffer, "w")
             skip_stitch_computation = self._should_skip_stitch_plan_computation(file_formats)
             non_empty_count = len([text for text in texts if text])
+            direct_svg_mode = include_preview and self.draft_mode and file_formats == ['svg'] and non_empty_count == 1
+            direct_svg_content = None
+            preview_payload = None
+            zip_buffer = None if direct_svg_mode else io.BytesIO()
+            zip_file = None if direct_svg_mode else ZipFile(zip_buffer, "w")
             processed_count = 0
             progress_state = {"pct": 1}
             progress_state_lock = threading.Lock()
@@ -325,9 +388,16 @@ class DaemonLettering(InkstitchExtension):
                     stitch_plan, lettering_group = self.generate_stitch_plan(text, text_positioning_path)
                     stitch_time_total += (time.perf_counter() - stitch_started_at)
 
+                if include_preview and stitch_plan is not None and preview_payload is None:
+                    preview_payload = self._serialize_preview_payload(stitch_plan)
+
+                if direct_svg_mode and direct_svg_content is None:
+                    direct_svg_content = etree.tostring(self.document.getroot()).decode('utf-8')
+
                 for file_format in file_formats:
-                    file_name = self.build_output_file_name(text, i, file_format)
-                    self.write_output_to_zip(zip_file, file_name, file_format, stitch_plan)
+                    if zip_file is not None:
+                        file_name = self.build_output_file_name(text, i, file_format)
+                        self.write_output_to_zip(zip_file, file_name, file_format, stitch_plan)
 
                 self.reset_document(lettering_group, text_positioning_path)
                 processed_count += 1
@@ -342,25 +412,38 @@ class DaemonLettering(InkstitchExtension):
                 if heartbeat_thread is not None:
                     heartbeat_thread.join(timeout=0.2)
 
-            package_started_at = time.perf_counter()
-            zip_file.close()
+            response_payload = {
+                "status": "success",
+                "cache_hit": False,
+                "draft_mode": self.draft_mode,
+            }
 
-            zip_data = zip_buffer.getvalue()
-            zip_b64 = base64.b64encode(zip_data).decode('utf-8')
-            self._set_cached_response(cache_key, zip_b64)
+            if direct_svg_mode:
+                response_payload["svg_content"] = direct_svg_content or ""
+            else:
+                package_started_at = time.perf_counter()
+                zip_file.close()
+                zip_data = zip_buffer.getvalue()
+                response_payload["zip_base64"] = base64.b64encode(zip_data).decode('utf-8')
+
+            if preview_payload is not None:
+                response_payload["preview_payload"] = preview_payload
+
+            cache_payload = deepcopy(response_payload)
+            cache_payload.pop("status", None)
+            cache_payload.pop("cache_hit", None)
+            cache_payload.pop("elapsed_ms", None)
+            cache_payload.pop("stitch_ms", None)
+            cache_payload.pop("package_ms", None)
+            cache_payload.pop("request_id", None)
+            self._set_cached_response(cache_key, cache_payload)
 
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
             stitch_ms = int(stitch_time_total * 1000)
             package_ms = int(((time.perf_counter() - package_started_at) if package_started_at else 0.0) * 1000)
-            response_payload = {
-                "status": "success",
-                "zip_base64": zip_b64,
-                "cache_hit": False,
-                "elapsed_ms": elapsed_ms,
-                "stitch_ms": stitch_ms,
-                "package_ms": package_ms,
-                "draft_mode": self.draft_mode,
-            }
+            response_payload["elapsed_ms"] = elapsed_ms
+            response_payload["stitch_ms"] = stitch_ms
+            response_payload["package_ms"] = package_ms
             if request_id:
                 response_payload["request_id"] = request_id
             self._emit_json(response_payload)
