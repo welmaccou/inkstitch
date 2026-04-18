@@ -38,6 +38,7 @@ class DaemonLettering(InkstitchExtension):
 
         self._font_cache = {}
         self._response_cache = OrderedDict()
+        self._thread_palette = None
         self._stdout_lock = threading.Lock()
 
         self.arg_parser.add_argument('--notebook')
@@ -337,6 +338,7 @@ class DaemonLettering(InkstitchExtension):
         self.metadata = self.get_inkstitch_metadata()
         self.collapse_len = self.metadata['collapse_len_mm']
         self.min_stitch_len = self.metadata['min_stitch_len_mm']
+        self._thread_palette = self.metadata.get('thread-palette')
 
         # Draft mode trades some stitch fidelity for responsiveness during editing.
         if self.draft_mode:
@@ -506,8 +508,7 @@ class DaemonLettering(InkstitchExtension):
 
     def write_output_to_zip(self, zip_file, file_name, file_format, stitch_plan):
         if file_format == 'svg':
-            document = deepcopy(self.document.getroot())
-            zip_file.writestr(file_name, etree.tostring(document).decode('utf-8'))
+            zip_file.writestr(file_name, etree.tostring(self.document.getroot()).decode('utf-8'))
             return
 
         if stitch_plan is None:
@@ -572,7 +573,10 @@ class DaemonLettering(InkstitchExtension):
         self.get_elements()
         stitch_groups = self.elements_to_stitch_groups(self.elements)
         stitch_plan = stitch_groups_to_stitch_plan(stitch_groups, collapse_len=self.collapse_len, min_stitch_len=self.min_stitch_len)
-        ThreadCatalog().match_and_apply_palette(stitch_plan, self.get_inkstitch_metadata()['thread-palette'])
+
+        # Draft preview does not require expensive palette nearest-color matching.
+        if not self.draft_mode:
+            ThreadCatalog().match_and_apply_palette(stitch_plan, self._thread_palette)
 
         return stitch_plan, lettering_group
 

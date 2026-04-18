@@ -22,6 +22,7 @@ class ThreadPalette(Set):
 
     def __init__(self, palette_file):
         self.threads = dict()
+        self._nearest_cache = {}
         self.parse_palette_file(palette_file)
 
     def parse_palette_file(self, palette_file):
@@ -88,6 +89,12 @@ class ThreadPalette(Set):
         if isinstance(color, ThreadColor):
             color = color.rgb
 
-        color = convert_color(sRGBColor(*color, is_upscaled=True), LabColor)
+        color_key = tuple(int(channel) for channel in color)
+        cached = self._nearest_cache.get(color_key)
+        if cached is not None:
+            return cached
 
-        return min(self, key=lambda thread: compare_thread_colors(self.threads[thread], color))
+        color = convert_color(sRGBColor(*color, is_upscaled=True), LabColor)
+        nearest = min(self, key=lambda thread: compare_thread_colors(self.threads[thread], color))
+        self._nearest_cache[color_key] = nearest
+        return nearest
