@@ -49,8 +49,11 @@ class DaemonLettering(InkstitchExtension):
         pass
 
     def run(self, args=None):
-        svg_str = '<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="100" height="100" viewBox="0 0 100 100"></svg>'
-        self.document = etree.fromstring(svg_str.encode('utf-8')).getroottree()
+        from io import BytesIO
+        import inkex
+        
+        svg_str = b'<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.0.dtd" width="100mm" height="100mm" viewBox="0 0 100 100"><sodipodi:namedview id="namedview1"/><metadata id="metadata1"/></svg>'
+        self.document = inkex.load_svg(BytesIO(svg_str))
         self.svg = self.document.getroot()
         
         # Envia sinal de pronto
