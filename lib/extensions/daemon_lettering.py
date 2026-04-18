@@ -11,6 +11,7 @@ import tempfile
 import base64
 import io
 import time
+import threading
 from collections import OrderedDict
 from copy import deepcopy 
 from zipfile import ZipFile
@@ -37,6 +38,7 @@ class DaemonLettering(InkstitchExtension):
 
         self._font_cache = {}
         self._response_cache = OrderedDict()
+        self._stdout_lock = threading.Lock()
 
         self.arg_parser.add_argument('--notebook')
         self.arg_parser.add_argument('--text', type=str, default='', dest='text')
@@ -56,6 +58,10 @@ class DaemonLettering(InkstitchExtension):
     def effect(self):
         pass
 
+    def _emit_json(self, payload):
+        with self._stdout_lock:
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+
     def run(self, args=None):
         from io import BytesIO
         import inkex
@@ -66,7 +72,7 @@ class DaemonLettering(InkstitchExtension):
         self.svg = self.document.getroot()
         
         # Envia sinal de pronto
-        print(json.dumps({"status": "ready"}), flush=True)
+        self._emit_json({"status": "ready"})
 
         for line in sys.stdin:
             line = line.strip()
@@ -85,8 +91,77 @@ class DaemonLettering(InkstitchExtension):
             except Exception as e:
                 self.send_error(f"Error parsing or handling: {str(e)}")
 
-    def send_error(self, message):
-        print(json.dumps({"status": "error", "message": message}), flush=True)
+    def send_error(self, message, request_id=None):
+        payload = {"status": "error", "message": message}
+        if request_id:
+            payload["request_id"] = request_id
+        self._emit_json(payload)
+
+    def _emit_progress(self, request_id, message, progress_pct=None):
+        payload = {
+            "status": "progress",
+            "stage": "generate_points",
+            "message": message,
+        }
+        if request_id:
+            payload["request_id"] = request_id
+        if progress_pct is not None:
+            payload["progress_pct"] = int(max(0, min(100, progress_pct)))
+        self._emit_json(payload)
+
+    def _should_skip_stitch_plan_computation(self, file_formats):
+        return self.draft_mode and len(file_formats) == 1 and file_formats[0] == 'svg'
+
+    def _render_text_svg_only(self, text, text_positioning_path):
+        self.settings = DotDict({
+            "text": text,
+            "text_align": self.text_align,
+            "back_and_forth": not self.draft_mode,
+            "font": self.font.marked_custom_font_id,
+            "scale": int(self.scale * 100),
+            "trim_option": self.trim,
+            "use_trim_symbols": self.options.command_symbols,
+            "color_sort": self.color_sort,
+            "letter_spacing": self.options.letter_spacing,
+            "word_spacing": self.options.word_spacing,
+            "line_height": self.options.line_height
+        })
+
+        lettering_group = Group()
+        lettering_group.label = "Ink/Stitch Lettering"
+        lettering_group.set('inkstitch:lettering', json.dumps(self.settings))
+        self.svg.append(lettering_group)
+        lettering_group.set("transform", get_correction_transform(lettering_group, child=True))
+
+        destination_group = Group()
+        destination_group.label = f"{self.font.name} scale {self.scale * 100}%"
+        lettering_group.append(destination_group)
+
+        self.font.render_text(
+            text,
+            destination_group,
+            trim_option=self.trim,
+            use_trim_symbols=self.options.command_symbols,
+            color_sort=self.color_sort,
+            text_align=self.text_align,
+            letter_spacing=self.options.letter_spacing,
+            word_spacing=self.options.word_spacing,
+            line_height=self.options.line_height
+        )
+
+        destination_group.attrib['transform'] = f'scale({self.scale})'
+
+        if text_positioning_path is not None:
+            parent = text_positioning_path.getparent()
+            index = parent.index(text_positioning_path)
+            parent.insert(index, lettering_group)
+            TextAlongPath(self.svg, lettering_group, text_positioning_path, self.options.text_position)
+            text_positioning_path.delete()
+
+        # Keep element state refreshed between iterations for consistent cleanup behavior.
+        self.get_elements()
+
+        return lettering_group
 
     def _get_cached_font(self, font_id):
         cached = self._font_cache.get(font_id)
@@ -140,38 +215,44 @@ class DaemonLettering(InkstitchExtension):
         started_at = time.perf_counter()
         stitch_time_total = 0.0
         package_started_at = None
+        heartbeat_stop = None
+        heartbeat_thread = None
+        request_id = payload.get("request_id")
         text_input = payload.get("text", "")
         if not text_input:
-            self.send_error("Please specify a text")
+            self.send_error("Please specify a text", request_id=request_id)
             return
             
         font_id = payload.get("font", "")
         if not font_id:
-            self.send_error("Please specify a font")
+            self.send_error("Please specify a font", request_id=request_id)
             return
             
         self.font = self._get_cached_font(font_id)
         if self.font is None:
-            self.send_error("Please specify a valid font name.")
+            self.send_error("Please specify a valid font name.", request_id=request_id)
             return
 
         file_formats = payload.get("formats", ["svg", "pes"])
         available_formats = [file_format['extension'] for file_format in pystitch.supported_formats()] + ['svg']
         file_formats = [f.strip().lower() for f in file_formats if f.strip().lower() in available_formats]
         if not file_formats:
-            self.send_error("No valid formats")
+            self.send_error("No valid formats", request_id=request_id)
             return
 
         cache_key = self._build_cache_key(payload, file_formats)
         cached_zip_b64 = self._get_cached_response(cache_key)
         if cached_zip_b64 is not None:
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-            print(json.dumps({
+            response_payload = {
                 "status": "success",
                 "zip_base64": cached_zip_b64,
                 "cache_hit": True,
                 "elapsed_ms": elapsed_ms,
-            }), flush=True)
+            }
+            if request_id:
+                response_payload["request_id"] = request_id
+            self._emit_json(response_payload)
             return
 
         self.options.trim = payload.get("trim", "off")
@@ -205,22 +286,61 @@ class DaemonLettering(InkstitchExtension):
         text_positioning_path = self.svg.findone(".//*[@inkscape:label='batch lettering']")
 
         try:
+            self._emit_progress(request_id, "Gerando pontos no Ink/Stitch...", progress_pct=1)
             zip_buffer = io.BytesIO()
             zip_file = ZipFile(zip_buffer, "w")
+            skip_stitch_computation = self._should_skip_stitch_plan_computation(file_formats)
+            non_empty_count = len([text for text in texts if text])
+            processed_count = 0
+            progress_state = {"pct": 1}
+            progress_state_lock = threading.Lock()
+
+            if not skip_stitch_computation and non_empty_count > 0:
+                heartbeat_stop = threading.Event()
+                heartbeat_started_at = time.perf_counter()
+
+                def _heartbeat_loop():
+                    while not heartbeat_stop.wait(3.0):
+                        with progress_state_lock:
+                            current_pct = int(max(1, min(94, progress_state["pct"])))
+                        elapsed_seconds = int(time.perf_counter() - heartbeat_started_at)
+                        self._emit_progress(
+                            request_id,
+                            f"Gerando pontos no Ink/Stitch... {elapsed_seconds}s",
+                            progress_pct=current_pct,
+                        )
+
+                heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+                heartbeat_thread.start()
 
             for i, text in enumerate(texts):
                 if not text:
                     continue
 
-                stitch_started_at = time.perf_counter()
-                stitch_plan, lettering_group = self.generate_stitch_plan(text, text_positioning_path)
-                stitch_time_total += (time.perf_counter() - stitch_started_at)
+                if skip_stitch_computation:
+                    stitch_plan = None
+                    lettering_group = self._render_text_svg_only(text, text_positioning_path)
+                else:
+                    stitch_started_at = time.perf_counter()
+                    stitch_plan, lettering_group = self.generate_stitch_plan(text, text_positioning_path)
+                    stitch_time_total += (time.perf_counter() - stitch_started_at)
 
                 for file_format in file_formats:
                     file_name = self.build_output_file_name(text, i, file_format)
                     self.write_output_to_zip(zip_file, file_name, file_format, stitch_plan)
 
                 self.reset_document(lettering_group, text_positioning_path)
+                processed_count += 1
+                if non_empty_count > 0:
+                    progress_pct = int(2 + ((processed_count / non_empty_count) * 95))
+                    with progress_state_lock:
+                        progress_state["pct"] = progress_pct
+                    self._emit_progress(request_id, "Gerando pontos no Ink/Stitch...", progress_pct=progress_pct)
+
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+                if heartbeat_thread is not None:
+                    heartbeat_thread.join(timeout=0.2)
 
             package_started_at = time.perf_counter()
             zip_file.close()
@@ -232,7 +352,7 @@ class DaemonLettering(InkstitchExtension):
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
             stitch_ms = int(stitch_time_total * 1000)
             package_ms = int(((time.perf_counter() - package_started_at) if package_started_at else 0.0) * 1000)
-            print(json.dumps({
+            response_payload = {
                 "status": "success",
                 "zip_base64": zip_b64,
                 "cache_hit": False,
@@ -240,9 +360,15 @@ class DaemonLettering(InkstitchExtension):
                 "stitch_ms": stitch_ms,
                 "package_ms": package_ms,
                 "draft_mode": self.draft_mode,
-            }), flush=True)
+            }
+            if request_id:
+                response_payload["request_id"] = request_id
+            self._emit_json(response_payload)
         except Exception as e:
-            self.send_error(str(e))
+            self.send_error(str(e), request_id=request_id)
+        finally:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
 
     def setup_trim(self):
         self.trim = 0
@@ -300,6 +426,9 @@ class DaemonLettering(InkstitchExtension):
             document = deepcopy(self.document.getroot())
             zip_file.writestr(file_name, etree.tostring(document).decode('utf-8'))
             return
+
+        if stitch_plan is None:
+            raise ValueError(f"Cannot generate format '{file_format}' without stitch plan computation")
 
         temp_file = tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False)
         try:
