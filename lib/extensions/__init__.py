@@ -15,6 +15,7 @@ from .cleanup import Cleanup
 from .commands_scale_symbols import CommandsScaleSymbols
 from .cross_stitch_helper import CrossStitchHelper
 from .cut_satin import CutSatin
+from .daemon_lettering import DaemonLettering
 from .cutwork_segmentation import CutworkSegmentation
 from .density_map import DensityMap
 from .display_stacking_order import DisplayStackingOrder
@@ -96,6 +97,7 @@ extensions = [
     CrossStitchHelper,
     CutSatin,
     CutworkSegmentation,
+    DaemonLettering,
     DensityMap,
     DisplayStackingOrder,
     DuplicateParams,
