@@ -4,6 +4,7 @@
 # Licensed under the GNU GPL version 3.0 or later.  See the file LICENSE for details.
 
 import os
+from collections import OrderedDict
 from collections.abc import Sequence
 from glob import glob
 
@@ -14,8 +15,12 @@ from .palette import ThreadPalette
 class _ThreadCatalog(Sequence):
     """Holds a set of ThreadPalettes."""
 
+    MAX_MATCH_CACHE_ITEMS = 128
+
     def __init__(self):
         self.palettes = []
+        self._palettes_by_name = {}
+        self._match_cache = OrderedDict()
         self.load_palettes(self.get_palettes_paths())
 
     def get_palettes_paths(self):
@@ -38,7 +43,8 @@ class _ThreadCatalog(Sequence):
                     palette = ThreadPalette(palette_file)
                     if not palette.is_gimp_palette:
                         continue
-                    self.palettes.append(ThreadPalette(palette_file))
+                    self.palettes.append(palette)
+                    self._palettes_by_name[palette.name] = palette
                     palettes.append(palette_basename)
 
     def palette_names(self):
@@ -78,6 +84,14 @@ class _ThreadCatalog(Sequence):
             return None
 
         threads = [color_block.color for color_block in stitch_plan]
+        signature = tuple(sorted(color.rgb for color in threads if color is not None))
+        cached_palette_name = self._match_cache.get(signature)
+        if cached_palette_name is not None:
+            palette = self.get_palette_by_name(cached_palette_name)
+            if palette is not None:
+                self._match_cache.move_to_end(signature)
+                return palette
+
         palettes_and_matches = [(palette, self._num_exact_color_matches(palette, threads))
                                 for palette in self]
         palette, matches = max(palettes_and_matches, key=lambda item: item[1])
@@ -87,6 +101,10 @@ class _ThreadCatalog(Sequence):
             # don't use this palette
             return None
         else:
+            self._match_cache[signature] = palette.name
+            self._match_cache.move_to_end(signature)
+            while len(self._match_cache) > self.MAX_MATCH_CACHE_ITEMS:
+                self._match_cache.popitem(last=False)
             return palette
 
     def apply_palette(self, stitch_plan, palette):
@@ -94,8 +112,6 @@ class _ThreadCatalog(Sequence):
             if color_block.color.chart:
                 # do not overwrite cutwork settings
                 continue
-
-        for color_block in stitch_plan:
             nearest = palette.nearest_color(color_block.color)
 
             color_block.color.name = nearest.name
@@ -104,9 +120,7 @@ class _ThreadCatalog(Sequence):
             color_block.color.description = nearest.description
 
     def get_palette_by_name(self, name):
-        for palette in self:
-            if palette.name == name:
-                return palette
+        return self._palettes_by_name.get(name)
 
 
 _catalog = None

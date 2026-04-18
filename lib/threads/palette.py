@@ -4,6 +4,7 @@
 # Licensed under the GNU GPL version 3.0 or later.  See the file LICENSE for details.
 
 from collections.abc import Set
+from collections import OrderedDict
 
 from colormath2.color_conversions import convert_color
 from colormath2.color_diff import delta_e_cie1994
@@ -20,10 +21,29 @@ def compare_thread_colors(color1, color2):
 class ThreadPalette(Set):
     """Holds a set of ThreadColors all from the same manufacturer."""
 
+    MAX_NEAREST_CACHE_ITEMS = 2048
+    MAX_GLOBAL_LAB_CACHE_ITEMS = 4096
+    _global_lab_cache = OrderedDict()
+
     def __init__(self, palette_file):
         self.threads = dict()
-        self._nearest_cache = {}
+        self._nearest_cache = OrderedDict()
         self.parse_palette_file(palette_file)
+
+    @classmethod
+    def _get_or_build_lab(cls, rgb):
+        key = tuple(int(channel) for channel in rgb)
+        cached = cls._global_lab_cache.get(key)
+        if cached is not None:
+            cls._global_lab_cache.move_to_end(key)
+            return cached
+
+        lab_value = convert_color(sRGBColor(*key, is_upscaled=True), LabColor)
+        cls._global_lab_cache[key] = lab_value
+        cls._global_lab_cache.move_to_end(key)
+        while len(cls._global_lab_cache) > cls.MAX_GLOBAL_LAB_CACHE_ITEMS:
+            cls._global_lab_cache.popitem(last=False)
+        return lab_value
 
     def parse_palette_file(self, palette_file):
         """Read a GIMP palette file and load thread colors.
@@ -92,9 +112,13 @@ class ThreadPalette(Set):
         color_key = tuple(int(channel) for channel in color)
         cached = self._nearest_cache.get(color_key)
         if cached is not None:
+            self._nearest_cache.move_to_end(color_key)
             return cached
 
-        color = convert_color(sRGBColor(*color, is_upscaled=True), LabColor)
+        color = self._get_or_build_lab(color)
         nearest = min(self, key=lambda thread: compare_thread_colors(self.threads[thread], color))
         self._nearest_cache[color_key] = nearest
+        self._nearest_cache.move_to_end(color_key)
+        while len(self._nearest_cache) > self.MAX_NEAREST_CACHE_ITEMS:
+            self._nearest_cache.popitem(last=False)
         return nearest

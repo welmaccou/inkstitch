@@ -13,7 +13,6 @@ import io
 import time
 import threading
 from collections import OrderedDict
-from copy import deepcopy 
 from zipfile import ZipFile
 
 from inkex import Boolean, Group
@@ -176,26 +175,22 @@ class DaemonLettering(InkstitchExtension):
         return font
 
     def _build_cache_key(self, payload, file_formats):
-        return json.dumps(
-            {
-                "text": payload.get("text", ""),
-                "separator": payload.get("separator", "\n"),
-                "font": payload.get("font", ""),
-                "scale": int(payload.get("scale", 100)),
-                "trim": payload.get("trim", "off"),
-                "text_align": payload.get("text_align", "left"),
-                "color_sort": payload.get("color_sort", "off"),
-                "command_symbols": bool(payload.get("command_symbols", False)),
-                "letter_spacing": float(payload.get("letter_spacing", 0.0)),
-                "word_spacing": float(payload.get("word_spacing", 0.0)),
-                "line_height": float(payload.get("line_height", 0.0)),
-                "text_position": payload.get("text_position", "left"),
-                "draft_mode": bool(payload.get("draft_mode", False)),
-                "include_preview": bool(payload.get("include_preview", False)),
-                "formats": list(file_formats),
-            },
-            sort_keys=True,
-            ensure_ascii=False,
+        return (
+            payload.get("text", ""),
+            payload.get("separator", "\n"),
+            payload.get("font", ""),
+            int(payload.get("scale", 100)),
+            payload.get("trim", "off"),
+            payload.get("text_align", "left"),
+            payload.get("color_sort", "off"),
+            bool(payload.get("command_symbols", False)),
+            float(payload.get("letter_spacing", 0.0)),
+            float(payload.get("word_spacing", 0.0)),
+            float(payload.get("line_height", 0.0)),
+            payload.get("text_position", "left"),
+            bool(payload.get("draft_mode", False)),
+            bool(payload.get("include_preview", False)),
+            tuple(file_formats),
         )
 
     def _get_cached_response(self, cache_key):
@@ -305,7 +300,7 @@ class DaemonLettering(InkstitchExtension):
         cached_response = self._get_cached_response(cache_key)
         if cached_response is not None:
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-            response_payload = deepcopy(cached_response)
+            response_payload = dict(cached_response)
             response_payload["status"] = "success"
             response_payload["cache_hit"] = True
             response_payload["elapsed_ms"] = elapsed_ms
@@ -431,7 +426,7 @@ class DaemonLettering(InkstitchExtension):
             if preview_payload is not None:
                 response_payload["preview_payload"] = preview_payload
 
-            cache_payload = deepcopy(response_payload)
+            cache_payload = dict(response_payload)
             cache_payload.pop("status", None)
             cache_payload.pop("cache_hit", None)
             cache_payload.pop("elapsed_ms", None)
