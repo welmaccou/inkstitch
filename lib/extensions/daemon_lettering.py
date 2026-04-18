@@ -9,6 +9,9 @@ import string
 import sys
 import tempfile
 import base64
+import io
+import time
+from collections import OrderedDict
 from copy import deepcopy 
 from zipfile import ZipFile
 
@@ -27,8 +30,13 @@ from ..utils import DotDict
 from .base import InkstitchExtension
 
 class DaemonLettering(InkstitchExtension):
+    MAX_RESPONSE_CACHE_ITEMS = 32
+
     def __init__(self, *args, **kwargs):
         InkstitchExtension.__init__(self)
+
+        self._font_cache = {}
+        self._response_cache = OrderedDict()
 
         self.arg_parser.add_argument('--notebook')
         self.arg_parser.add_argument('--text', type=str, default='', dest='text')
@@ -80,7 +88,58 @@ class DaemonLettering(InkstitchExtension):
     def send_error(self, message):
         print(json.dumps({"status": "error", "message": message}), flush=True)
 
+    def _get_cached_font(self, font_id):
+        cached = self._font_cache.get(font_id)
+        if cached is not None:
+            return cached
+
+        font = get_font_by_name(font_id, False)
+        if font is not None:
+            self._font_cache[font_id] = font
+        return font
+
+    def _build_cache_key(self, payload, file_formats):
+        return json.dumps(
+            {
+                "text": payload.get("text", ""),
+                "separator": payload.get("separator", "\n"),
+                "font": payload.get("font", ""),
+                "scale": int(payload.get("scale", 100)),
+                "trim": payload.get("trim", "off"),
+                "text_align": payload.get("text_align", "left"),
+                "color_sort": payload.get("color_sort", "off"),
+                "command_symbols": bool(payload.get("command_symbols", False)),
+                "letter_spacing": float(payload.get("letter_spacing", 0.0)),
+                "word_spacing": float(payload.get("word_spacing", 0.0)),
+                "line_height": float(payload.get("line_height", 0.0)),
+                "text_position": payload.get("text_position", "left"),
+                "draft_mode": bool(payload.get("draft_mode", False)),
+                "formats": list(file_formats),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+
+    def _get_cached_response(self, cache_key):
+        cached = self._response_cache.get(cache_key)
+        if cached is None:
+            return None
+
+        # LRU bump
+        self._response_cache.move_to_end(cache_key)
+        return cached
+
+    def _set_cached_response(self, cache_key, zip_b64):
+        self._response_cache[cache_key] = zip_b64
+        self._response_cache.move_to_end(cache_key)
+
+        while len(self._response_cache) > self.MAX_RESPONSE_CACHE_ITEMS:
+            self._response_cache.popitem(last=False)
+
     def handle_generate(self, payload):
+        started_at = time.perf_counter()
+        stitch_time_total = 0.0
+        package_started_at = None
         text_input = payload.get("text", "")
         if not text_input:
             self.send_error("Please specify a text")
@@ -91,7 +150,7 @@ class DaemonLettering(InkstitchExtension):
             self.send_error("Please specify a font")
             return
             
-        self.font = get_font_by_name(font_id, False)
+        self.font = self._get_cached_font(font_id)
         if self.font is None:
             self.send_error("Please specify a valid font name.")
             return
@@ -103,6 +162,18 @@ class DaemonLettering(InkstitchExtension):
             self.send_error("No valid formats")
             return
 
+        cache_key = self._build_cache_key(payload, file_formats)
+        cached_zip_b64 = self._get_cached_response(cache_key)
+        if cached_zip_b64 is not None:
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            print(json.dumps({
+                "status": "success",
+                "zip_base64": cached_zip_b64,
+                "cache_hit": True,
+                "elapsed_ms": elapsed_ms,
+            }), flush=True)
+            return
+
         self.options.trim = payload.get("trim", "off")
         self.options.text_align = payload.get("text_align", "left")
         self.options.color_sort = payload.get("color_sort", "off")
@@ -112,6 +183,7 @@ class DaemonLettering(InkstitchExtension):
         self.options.word_spacing = float(payload.get("word_spacing", 0))
         self.options.line_height = float(payload.get("line_height", 0))
         self.options.text_position = payload.get("text_position", "left")
+        self.draft_mode = bool(payload.get("draft_mode", False))
         
         separator = payload.get("separator", "\n")
         texts = text_input.replace('\\n', '\n').split(separator)
@@ -125,45 +197,52 @@ class DaemonLettering(InkstitchExtension):
         self.collapse_len = self.metadata['collapse_len_mm']
         self.min_stitch_len = self.metadata['min_stitch_len_mm']
 
+        # Draft mode trades some stitch fidelity for responsiveness during editing.
+        if self.draft_mode:
+            self.collapse_len *= 1.8
+            self.min_stitch_len *= 1.6
+
         text_positioning_path = self.svg.findone(".//*[@inkscape:label='batch lettering']")
 
-        path = tempfile.mkdtemp()
-        files = []
         try:
+            zip_buffer = io.BytesIO()
+            zip_file = ZipFile(zip_buffer, "w")
+
             for i, text in enumerate(texts):
                 if not text:
                     continue
+
+                stitch_started_at = time.perf_counter()
                 stitch_plan, lettering_group = self.generate_stitch_plan(text, text_positioning_path)
+                stitch_time_total += (time.perf_counter() - stitch_started_at)
+
                 for file_format in file_formats:
-                    files.append(self.generate_output_file(file_format, path, text, stitch_plan, i))
+                    file_name = self.build_output_file_name(text, i, file_format)
+                    self.write_output_to_zip(zip_file, file_name, file_format, stitch_plan)
+
                 self.reset_document(lettering_group, text_positioning_path)
-            
-            temp_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
-            temp_file.close()
 
-            with ZipFile(temp_file.name, "w") as zip_file:
-                for output in files:
-                    zip_file.write(output, os.path.basename(output))
+            package_started_at = time.perf_counter()
+            zip_file.close()
 
-            with open(temp_file.name, 'rb') as output_file:
-                zip_data = output_file.read()
-            
+            zip_data = zip_buffer.getvalue()
             zip_b64 = base64.b64encode(zip_data).decode('utf-8')
-            
+            self._set_cached_response(cache_key, zip_b64)
+
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            stitch_ms = int(stitch_time_total * 1000)
+            package_ms = int(((time.perf_counter() - package_started_at) if package_started_at else 0.0) * 1000)
             print(json.dumps({
                 "status": "success",
-                "zip_base64": zip_b64
+                "zip_base64": zip_b64,
+                "cache_hit": False,
+                "elapsed_ms": elapsed_ms,
+                "stitch_ms": stitch_ms,
+                "package_ms": package_ms,
+                "draft_mode": self.draft_mode,
             }), flush=True)
-
-            os.remove(temp_file.name)
         except Exception as e:
             self.send_error(str(e))
-        finally:
-            for output in files:
-                if os.path.exists(output):
-                    os.remove(output)
-            if os.path.exists(path):
-                os.rmdir(path)
 
     def setup_trim(self):
         self.trim = 0
@@ -208,28 +287,35 @@ class DaemonLettering(InkstitchExtension):
             parent.insert(index, text_positioning_path)
         lettering_group.delete()
 
-    def generate_output_file(self, file_format, path, text, stitch_plan, iteration):
+    def build_output_file_name(self, text, iteration, file_format):
         allowed_characters = string.ascii_letters + string.digits
         filtered_text = ''.join(x for x in text if x in allowed_characters)
         if filtered_text:
             filtered_text = f'-{filtered_text}'
         file_name = f'{iteration:03d}{filtered_text:.8}'
-        output_file = os.path.join(path, f"{file_name}.{file_format}")
+        return f"{file_name}.{file_format}"
 
+    def write_output_to_zip(self, zip_file, file_name, file_format, stitch_plan):
         if file_format == 'svg':
             document = deepcopy(self.document.getroot())
-            with open(output_file, 'w', encoding='utf-8') as svg:
-                svg.write(etree.tostring(document).decode('utf-8'))
-        else:
-            write_embroidery_file(output_file, stitch_plan, self.document.getroot())
+            zip_file.writestr(file_name, etree.tostring(document).decode('utf-8'))
+            return
 
-        return output_file
+        temp_file = tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False)
+        try:
+            temp_file.close()
+            write_embroidery_file(temp_file.name, stitch_plan, self.document.getroot())
+            with open(temp_file.name, 'rb') as handle:
+                zip_file.writestr(file_name, handle.read())
+        finally:
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
 
     def generate_stitch_plan(self, text, text_positioning_path):
         self.settings = DotDict({
             "text": text,
             "text_align": self.text_align,
-            "back_and_forth": True,
+            "back_and_forth": not self.draft_mode,
             "font": self.font.marked_custom_font_id,
             "scale": int(self.scale * 100),
             "trim_option": self.trim,
