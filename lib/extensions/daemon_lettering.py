@@ -30,12 +30,23 @@ from ..utils import DotDict
 from .base import InkstitchExtension
 
 class DaemonLettering(InkstitchExtension):
+    PROTOCOL_VERSION = 1
+    CAPABILITIES = [
+        "request_id",
+        "progress_events",
+        "cache_metadata",
+        "preview_payload",
+        "timings_basic",
+        "draft_mode",
+        "direct_svg_mode",
+    ]
+    MAX_FONT_CACHE_ITEMS = 64
     MAX_RESPONSE_CACHE_ITEMS = 32
 
     def __init__(self, *args, **kwargs):
         InkstitchExtension.__init__(self)
 
-        self._font_cache = {}
+        self._font_cache = OrderedDict()
         self._response_cache = OrderedDict()
         self._thread_palette = None
         self._stdout_lock = threading.Lock()
@@ -59,6 +70,9 @@ class DaemonLettering(InkstitchExtension):
         pass
 
     def _emit_json(self, payload):
+        if isinstance(payload, dict):
+            payload.setdefault("schema_version", self.PROTOCOL_VERSION)
+            payload.setdefault("capabilities", self.CAPABILITIES)
         with self._stdout_lock:
             print(json.dumps(payload, ensure_ascii=False), flush=True)
 
@@ -167,11 +181,15 @@ class DaemonLettering(InkstitchExtension):
     def _get_cached_font(self, font_id):
         cached = self._font_cache.get(font_id)
         if cached is not None:
+            self._font_cache.move_to_end(font_id)
             return cached
 
         font = get_font_by_name(font_id, False)
         if font is not None:
             self._font_cache[font_id] = font
+            self._font_cache.move_to_end(font_id)
+            while len(self._font_cache) > self.MAX_FONT_CACHE_ITEMS:
+                self._font_cache.popitem(last=False)
         return font
 
     def _build_cache_key(self, payload, file_formats):
@@ -271,6 +289,7 @@ class DaemonLettering(InkstitchExtension):
         started_at = time.perf_counter()
         stitch_time_total = 0.0
         package_started_at = None
+        preview_serialize_total = 0.0
         heartbeat_stop = None
         heartbeat_thread = None
         request_id = payload.get("request_id")
@@ -304,6 +323,18 @@ class DaemonLettering(InkstitchExtension):
             response_payload["status"] = "success"
             response_payload["cache_hit"] = True
             response_payload["elapsed_ms"] = elapsed_ms
+            response_payload["timing_stage_ms"] = {
+                "cache_lookup_ms": elapsed_ms,
+                "setup_ms": 0,
+                "stitch_ms": 0,
+                "preview_serialize_ms": 0,
+                "package_ms": 0,
+            }
+            response_payload["cache_metadata"] = {
+                "response_cache_hit": True,
+                "response_cache_items": len(self._response_cache),
+                "font_cache_items": len(self._font_cache),
+            }
             if request_id:
                 response_payload["request_id"] = request_id
             self._emit_json(response_payload)
@@ -339,6 +370,8 @@ class DaemonLettering(InkstitchExtension):
         if self.draft_mode:
             self.collapse_len *= 1.8
             self.min_stitch_len *= 1.6
+
+        setup_ms = int((time.perf_counter() - started_at) * 1000)
 
         text_positioning_path = self.svg.findone(".//*[@inkscape:label='batch lettering']")
 
@@ -386,15 +419,28 @@ class DaemonLettering(InkstitchExtension):
                     stitch_time_total += (time.perf_counter() - stitch_started_at)
 
                 if include_preview and stitch_plan is not None and preview_payload is None:
+                    preview_started_at = time.perf_counter()
                     preview_payload = self._serialize_preview_payload(stitch_plan)
+                    preview_serialize_total += (time.perf_counter() - preview_started_at)
+
+                serialized_svg_content = None
+                needs_svg_content = direct_svg_mode or (zip_file is not None and 'svg' in file_formats)
+                if needs_svg_content:
+                    serialized_svg_content = etree.tostring(self.document.getroot()).decode('utf-8')
 
                 if direct_svg_mode and direct_svg_content is None:
-                    direct_svg_content = etree.tostring(self.document.getroot()).decode('utf-8')
+                    direct_svg_content = serialized_svg_content or etree.tostring(self.document.getroot()).decode('utf-8')
 
                 for file_format in file_formats:
                     if zip_file is not None:
                         file_name = self.build_output_file_name(text, i, file_format)
-                        self.write_output_to_zip(zip_file, file_name, file_format, stitch_plan)
+                        self.write_output_to_zip(
+                            zip_file,
+                            file_name,
+                            file_format,
+                            stitch_plan,
+                            svg_content=serialized_svg_content,
+                        )
 
                 self.reset_document(lettering_group, text_positioning_path)
                 processed_count += 1
@@ -438,9 +484,21 @@ class DaemonLettering(InkstitchExtension):
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
             stitch_ms = int(stitch_time_total * 1000)
             package_ms = int(((time.perf_counter() - package_started_at) if package_started_at else 0.0) * 1000)
+            preview_serialize_ms = int(preview_serialize_total * 1000)
             response_payload["elapsed_ms"] = elapsed_ms
             response_payload["stitch_ms"] = stitch_ms
             response_payload["package_ms"] = package_ms
+            response_payload["timing_stage_ms"] = {
+                "setup_ms": setup_ms,
+                "stitch_ms": stitch_ms,
+                "preview_serialize_ms": preview_serialize_ms,
+                "package_ms": package_ms,
+            }
+            response_payload["cache_metadata"] = {
+                "response_cache_hit": False,
+                "response_cache_items": len(self._response_cache),
+                "font_cache_items": len(self._font_cache),
+            }
             if request_id:
                 response_payload["request_id"] = request_id
             self._emit_json(response_payload)
@@ -501,9 +559,11 @@ class DaemonLettering(InkstitchExtension):
         file_name = f'{iteration:03d}{filtered_text:.8}'
         return f"{file_name}.{file_format}"
 
-    def write_output_to_zip(self, zip_file, file_name, file_format, stitch_plan):
+    def write_output_to_zip(self, zip_file, file_name, file_format, stitch_plan, svg_content=None):
         if file_format == 'svg':
-            zip_file.writestr(file_name, etree.tostring(self.document.getroot()).decode('utf-8'))
+            if svg_content is None:
+                svg_content = etree.tostring(self.document.getroot()).decode('utf-8')
+            zip_file.writestr(file_name, svg_content)
             return
 
         if stitch_plan is None:
