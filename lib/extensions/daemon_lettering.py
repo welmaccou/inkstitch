@@ -393,9 +393,14 @@ class DaemonLettering(InkstitchExtension):
                 heartbeat_started_at = time.perf_counter()
 
                 def _heartbeat_loop():
+                    fake_pct = 1
                     while not heartbeat_stop.wait(3.0):
                         with progress_state_lock:
-                            current_pct = int(max(1, min(94, progress_state["pct"])))
+                            # Se o progresso não avançou, incremente artificialmente
+                            if progress_state["pct"] < 94:
+                                fake_pct = min(94, progress_state["pct"] + 1)
+                                progress_state["pct"] = fake_pct
+                            current_pct = int(max(1, min(94, progress_state["pct"])));
                         elapsed_seconds = int(time.perf_counter() - heartbeat_started_at)
                         self._emit_progress(
                             request_id,
